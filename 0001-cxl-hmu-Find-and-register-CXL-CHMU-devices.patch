@@ -1,0 +1,433 @@
+From e1c574b74e13d17206345e6e261ecfca0d421c45 Mon Sep 17 00:00:00 2001
+From: Lukasz Wiecaszek <lukasz.wiecaszek@gmail.com>
+Date: Thu, 26 Jun 2025 14:51:17 +0200
+Subject: [PATCH] cxl/hmu: Find and register CXL CHMU devices
+
+CXL CHMU (CXL Hotness Monitoring Unit) devices can be found
+from entries in the Register Locator DVSEC.
+
+Signed-off-by: Lukasz Wiecaszek <lukasz.wiecaszek@gmail.com>
+---
+ drivers/cxl/core/Makefile |  1 +
+ drivers/cxl/core/core.h   |  1 +
+ drivers/cxl/core/hmu.c    | 76 +++++++++++++++++++++++++++++++++++++++
+ drivers/cxl/core/port.c   |  2 ++
+ drivers/cxl/core/regs.c   | 66 ++++++++++++++++++++++++++++++++++
+ drivers/cxl/cxl.h         | 26 ++++++++++++++
+ drivers/cxl/cxlpci.h      |  1 +
+ drivers/cxl/hmu.h         | 24 +++++++++++++
+ drivers/cxl/pci.c         | 45 +++++++++++++++++++++++
+ 9 files changed, 242 insertions(+)
+ create mode 100644 drivers/cxl/core/hmu.c
+ create mode 100644 drivers/cxl/hmu.h
+
+diff --git a/drivers/cxl/core/Makefile b/drivers/cxl/core/Makefile
+index 086df97a0fcf..555f620faa24 100644
+--- a/drivers/cxl/core/Makefile
++++ b/drivers/cxl/core/Makefile
+@@ -13,6 +13,7 @@ cxl_core-y += mbox.o
+ cxl_core-y += pci.o
+ cxl_core-y += hdm.o
+ cxl_core-y += pmu.o
++cxl_core-y += hmu.o
+ cxl_core-y += cdat.o
+ cxl_core-y += ras.o
+ cxl_core-y += acpi.o
+diff --git a/drivers/cxl/core/core.h b/drivers/cxl/core/core.h
+index 17b692eb3257..404fb65ff837 100644
+--- a/drivers/cxl/core/core.h
++++ b/drivers/cxl/core/core.h
+@@ -9,6 +9,7 @@
+ extern const struct device_type cxl_nvdimm_bridge_type;
+ extern const struct device_type cxl_nvdimm_type;
+ extern const struct device_type cxl_pmu_type;
++extern const struct device_type cxl_hmu_type;
+ 
+ extern struct attribute_group cxl_base_attribute_group;
+ 
+diff --git a/drivers/cxl/core/hmu.c b/drivers/cxl/core/hmu.c
+new file mode 100644
+index 000000000000..98cca3256fea
+--- /dev/null
++++ b/drivers/cxl/core/hmu.c
+@@ -0,0 +1,76 @@
++// SPDX-License-Identifier: GPL-2.0-only
++
++#include <linux/device.h>
++#include <linux/slab.h>
++#include <cxlmem.h>
++#include <hmu.h>
++#include <cxl.h>
++#include "core.h"
++
++static void cxl_hmu_release(struct device *dev)
++{
++	struct cxl_hmu *hmu = to_cxl_hmu(dev);
++
++	kfree(hmu);
++}
++
++const struct device_type cxl_hmu_type = {
++	.name = CXL_HMU_DEVICE_TYPE_NAME,
++	.release = cxl_hmu_release,
++};
++
++static void remove_dev(void *dev)
++{
++	device_unregister(dev);
++}
++
++static int devm_cxl_hmu_add_instance(struct device *parent,
++	void __iomem *regs, int block, int instance)
++{
++	struct cxl_hmu *hmu;
++	struct device *dev;
++	int rc;
++
++	hmu = kzalloc(sizeof(*hmu), GFP_KERNEL);
++	if (!hmu)
++		return -ENOMEM;
++
++	hmu->regs = regs;
++	hmu->block = block;
++	hmu->instance = instance;
++	dev = &hmu->dev;
++	device_initialize(dev);
++	device_set_pm_not_required(dev);
++	dev->parent = parent;
++	dev->bus = &cxl_bus_type;
++	dev->type = &cxl_hmu_type;
++	rc = dev_set_name(dev, "chmu%d.%d", block, instance);
++	if (rc)
++		goto out;
++
++	rc = device_add(dev);
++	if (rc)
++		goto out;
++
++	return devm_add_action_or_reset(parent, remove_dev, dev);
++
++out:
++	put_device(&hmu->dev);
++	return rc;
++}
++
++int devm_cxl_hmu_add(struct device *parent, int block,
++	const struct cxl_hmu_regs *regs)
++{
++	int rc, instance;
++
++	for (instance = 0; instance < CXL_CHMU_MAX_NUMBER_OF_INSTANCES; instance++) {
++		rc = devm_cxl_hmu_add_instance(parent,
++			regs->hmu[instance], block, instance);
++		if (rc)
++			return rc;
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL_NS_GPL(devm_cxl_hmu_add, "CXL");
+diff --git a/drivers/cxl/core/port.c b/drivers/cxl/core/port.c
+index 726bd4a7de27..fd153eaf0df4 100644
+--- a/drivers/cxl/core/port.c
++++ b/drivers/cxl/core/port.c
+@@ -74,6 +74,8 @@ static int cxl_device_id(const struct device *dev)
+ 		return CXL_DEVICE_REGION;
+ 	if (dev->type == &cxl_pmu_type)
+ 		return CXL_DEVICE_PMU;
++	if (dev->type == &cxl_hmu_type)
++		return CXL_DEVICE_HMU;
+ 	return 0;
+ }
+ 
+diff --git a/drivers/cxl/core/regs.c b/drivers/cxl/core/regs.c
+index 5ca7b0eed568..c5fe2bf8f8f7 100644
+--- a/drivers/cxl/core/regs.c
++++ b/drivers/cxl/core/regs.c
+@@ -176,6 +176,45 @@ void cxl_probe_device_regs(struct device *dev, void __iomem *base,
+ }
+ EXPORT_SYMBOL_NS_GPL(cxl_probe_device_regs, "CXL");
+ 
++/**
++ * cxl_probe_hmu_regs() - Detect CXL Hotness Monitoring Unit (CHMU) register blocks
++ * @dev: Host device of the @base mapping
++ * @base: Mapping containing the CHMU Common Capabilities register
++ * @map: Map object describing the register block information found
++ *
++ * See CXL 3.2 8.2.8 CHMU Register Interface
++ *
++ * Probe for CHMU register information and return it in map object.
++ */
++void cxl_probe_hmu_regs(struct device *dev, void __iomem *base,
++	struct cxl_hmu_reg_map *map)
++{
++	u8 version;
++	u8 number_of_instances;
++	u16 instance_length;
++
++	*map = (struct cxl_hmu_reg_map) { 0 };
++
++	version = readb(base + CXL_CHMU_VERSION_OFFSET);
++
++	if (version >= 1) {
++		u8 i;
++
++		number_of_instances = readb(base + CXL_CHMU_INSTANCES_OFFSET);
++		if (number_of_instances > CXL_CHMU_MAX_NUMBER_OF_INSTANCES)
++			number_of_instances = CXL_CHMU_MAX_NUMBER_OF_INSTANCES;
++		instance_length = readw(base + CXL_CHMU_INSTANCE_LENGTH_OFFSET);
++
++		for (i = 0; i < number_of_instances; i++) {
++			map->hmu[i].valid = 1;
++			map->hmu[i].id = i;
++			map->hmu[i].offset = 16 + i * instance_length;
++			map->hmu[i].size = instance_length;
++		}
++	}
++}
++EXPORT_SYMBOL_NS_GPL(cxl_probe_hmu_regs, "CXL");
++
+ void __iomem *devm_cxl_iomap_block(struct device *dev, resource_size_t addr,
+ 				   resource_size_t length)
+ {
+@@ -268,6 +307,29 @@ int cxl_map_device_regs(const struct cxl_register_map *map,
+ }
+ EXPORT_SYMBOL_NS_GPL(cxl_map_device_regs, "CXL");
+ 
++int cxl_map_hmu_regs(const struct cxl_register_map *map,
++	struct cxl_hmu_regs *regs)
++{
++	int instance;
++
++	*regs = (struct cxl_hmu_regs) { 0 };
++
++	for (instance = 0; instance < CXL_CHMU_MAX_NUMBER_OF_INSTANCES; instance++) {
++		const struct cxl_reg_map *reg_map = &map->hmu_map.hmu[instance];
++
++		if (!reg_map->valid)
++			break;
++
++		regs->hmu[instance] = devm_cxl_iomap_block(map->host,
++			reg_map->offset, reg_map->size);
++		if (!regs->hmu[instance])
++			return -ENOMEM;
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL_NS_GPL(cxl_map_hmu_regs, "CXL");
++
+ static bool cxl_decode_regblock(struct pci_dev *pdev, u32 reg_lo, u32 reg_hi,
+ 				struct cxl_register_map *map)
+ {
+@@ -460,6 +522,10 @@ static int cxl_probe_regs(struct cxl_register_map *map)
+ 
+ 		dev_dbg(host, "Probing device registers...\n");
+ 		break;
++	case CXL_REGLOC_RBI_HMU:
++		cxl_probe_hmu_regs(host, base, &map->hmu_map);
++		dev_dbg(host, "Probing HMU registers...\n");
++		break;
+ 	default:
+ 		break;
+ 	}
+diff --git a/drivers/cxl/cxl.h b/drivers/cxl/cxl.h
+index a9ab46eb0610..9a879ba11bcb 100644
+--- a/drivers/cxl/cxl.h
++++ b/drivers/cxl/cxl.h
+@@ -200,6 +200,12 @@ static inline int ways_to_eiw(unsigned int ways, u8 *eiw)
+ #define   CXLDEV_MBOX_BG_CMD_COMMAND_VENDOR_MASK GENMASK_ULL(63, 48)
+ #define CXLDEV_MBOX_PAYLOAD_OFFSET 0x20
+ 
++/* CXL 3.2 8.2.8 CHMU Register Interface */
++#define CXL_CHMU_MAX_NUMBER_OF_INSTANCES 8
++#define CXL_CHMU_VERSION_OFFSET 0x00
++#define CXL_CHMU_INSTANCES_OFFSET 0x01
++#define CXL_CHMU_INSTANCE_LENGTH_OFFSET 0x08
++
+ /*
+  * Using struct_group() allows for per register-block-type helper routines,
+  * without requiring block-type agnostic code to include the prefix.
+@@ -228,6 +234,14 @@ struct cxl_regs {
+ 		void __iomem *pmu;
+ 	);
+ 
++	/*
++	 * Array of CXL CHMU Register Interface base pointers
++	 * @hmu: CXL 3.2 8.2.8 CHMU Instance Registers
++	 */
++	struct_group_tagged(cxl_hmu_regs, hmu_regs,
++		void __iomem *hmu[CXL_CHMU_MAX_NUMBER_OF_INSTANCES];
++	);
++
+ 	/*
+ 	 * RCH downstream port specific RAS register
+ 	 * @aer: CXL 3.0 8.2.1.1 RCH Downstream Port RCRB
+@@ -267,6 +281,10 @@ struct cxl_pmu_reg_map {
+ 	struct cxl_reg_map pmu;
+ };
+ 
++struct cxl_hmu_reg_map {
++	struct cxl_reg_map hmu[CXL_CHMU_MAX_NUMBER_OF_INSTANCES];
++};
++
+ /**
+  * struct cxl_register_map - DVSEC harvested register block mapping parameters
+  * @host: device for devm operations and logging
+@@ -277,6 +295,7 @@ struct cxl_pmu_reg_map {
+  * @component_map: cxl_reg_map for component registers
+  * @device_map: cxl_reg_maps for device registers
+  * @pmu_map: cxl_reg_maps for CXL Performance Monitoring Units
++ * @hmu_map: cxl_reg_maps for CXL Hotness Monitoring Units
+  */
+ struct cxl_register_map {
+ 	struct device *host;
+@@ -288,6 +307,7 @@ struct cxl_register_map {
+ 		struct cxl_component_reg_map component_map;
+ 		struct cxl_device_reg_map device_map;
+ 		struct cxl_pmu_reg_map pmu_map;
++		struct cxl_hmu_reg_map hmu_map;
+ 	};
+ };
+ 
+@@ -295,12 +315,17 @@ void cxl_probe_component_regs(struct device *dev, void __iomem *base,
+ 			      struct cxl_component_reg_map *map);
+ void cxl_probe_device_regs(struct device *dev, void __iomem *base,
+ 			   struct cxl_device_reg_map *map);
++void cxl_probe_hmu_regs(struct device *dev, void __iomem *base,
++			   struct cxl_hmu_reg_map *map);
++
+ int cxl_map_component_regs(const struct cxl_register_map *map,
+ 			   struct cxl_component_regs *regs,
+ 			   unsigned long map_mask);
+ int cxl_map_device_regs(const struct cxl_register_map *map,
+ 			struct cxl_device_regs *regs);
+ int cxl_map_pmu_regs(struct cxl_register_map *map, struct cxl_pmu_regs *regs);
++int cxl_map_hmu_regs(const struct cxl_register_map *map,
++	struct cxl_hmu_regs *regs);
+ 
+ #define CXL_INSTANCES_COUNT -1
+ enum cxl_regloc_type;
+@@ -841,6 +866,7 @@ void cxl_driver_unregister(struct cxl_driver *cxl_drv);
+ #define CXL_DEVICE_PMEM_REGION		7
+ #define CXL_DEVICE_DAX_REGION		8
+ #define CXL_DEVICE_PMU			9
++#define CXL_DEVICE_HMU			10
+ 
+ #define MODULE_ALIAS_CXL(type) MODULE_ALIAS("cxl:t" __stringify(type) "*")
+ #define CXL_MODALIAS_FMT "cxl:t%d"
+diff --git a/drivers/cxl/cxlpci.h b/drivers/cxl/cxlpci.h
+index 54e219b0049e..f7b902eab288 100644
+--- a/drivers/cxl/cxlpci.h
++++ b/drivers/cxl/cxlpci.h
+@@ -73,6 +73,7 @@ enum cxl_regloc_type {
+ 	CXL_REGLOC_RBI_VIRT,
+ 	CXL_REGLOC_RBI_MEMDEV,
+ 	CXL_REGLOC_RBI_PMU,
++	CXL_REGLOC_RBI_HMU,
+ 	CXL_REGLOC_RBI_TYPES
+ };
+ 
+diff --git a/drivers/cxl/hmu.h b/drivers/cxl/hmu.h
+new file mode 100644
+index 000000000000..c6ea1cdb6728
+--- /dev/null
++++ b/drivers/cxl/hmu.h
+@@ -0,0 +1,24 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * CXL Specification rev 3.2 Setion 8.2.8 (CHMU Register Interface)
++ */
++#ifndef CXL_HMU_H
++#define CXL_HMU_H
++
++#include <linux/device.h>
++
++#define CXL_HMU_DEVICE_TYPE_NAME "cxl-hmu"
++
++struct cxl_hmu {
++	struct device dev;
++	void __iomem *regs;
++	int block;
++	int instance;
++};
++
++#define to_cxl_hmu(dev) container_of(dev, struct cxl_hmu, dev)
++
++int devm_cxl_hmu_add(struct device *parent, int block,
++		     const struct cxl_hmu_regs *regs);
++
++#endif
+diff --git a/drivers/cxl/pci.c b/drivers/cxl/pci.c
+index 785aa2af5eaa..3c822994b1a4 100644
+--- a/drivers/cxl/pci.c
++++ b/drivers/cxl/pci.c
+@@ -16,6 +16,7 @@
+ #include "cxlpci.h"
+ #include "cxl.h"
+ #include "pmu.h"
++#include "hmu.h"
+ 
+ /**
+  * DOC: cxl pci
+@@ -900,6 +901,46 @@ static struct attribute_group cxl_rcd_group = {
+ };
+ __ATTRIBUTE_GROUPS(cxl_rcd);
+ 
++static int cxl_setup_hmu(struct pci_dev *pdev)
++{
++	struct cxl_register_map map;
++	int i, rc, hmu_count;
++
++	hmu_count = cxl_count_regblock(pdev, CXL_REGLOC_RBI_HMU);
++	if (hmu_count < 0)
++		return hmu_count;
++
++	for (i = 0; i < hmu_count; i++) {
++		struct cxl_hmu_regs hmu_regs;
++
++		rc = cxl_find_regblock_instance(pdev, CXL_REGLOC_RBI_HMU, &map, i);
++		if (rc) {
++			dev_dbg(&pdev->dev, "Could not find HMU regblock\n");
++			break;
++		}
++
++		rc = cxl_setup_regs(&map);
++		if (rc) {
++			dev_dbg(&pdev->dev, "Could not setup HMU regs\n");
++			break;
++		}
++
++		rc = cxl_map_hmu_regs(&map, &hmu_regs);
++		if (rc) {
++			dev_dbg(&pdev->dev, "Could not map HMU regs\n");
++			break;
++		}
++
++		rc = devm_cxl_hmu_add(&pdev->dev, i, &hmu_regs);
++		if (rc) {
++			dev_dbg(&pdev->dev, "Could not add HMU regblock\n");
++			break;
++		}
++	}
++
++	return 0;
++}
++
+ static int cxl_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ {
+ 	struct pci_host_bridge *host_bridge = pci_find_host_bridge(pdev->bus);
+@@ -1048,6 +1089,10 @@ static int cxl_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 		}
+ 	}
+ 
++	rc = cxl_setup_hmu(pdev);
++	if (rc)
++		return rc;
++
+ 	rc = cxl_event_config(host_bridge, mds, irq_avail);
+ 	if (rc)
+ 		return rc;
+-- 
+2.49.0
+
