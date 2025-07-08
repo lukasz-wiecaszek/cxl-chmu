@@ -1,7 +1,7 @@
-From e1c574b74e13d17206345e6e261ecfca0d421c45 Mon Sep 17 00:00:00 2001
+From 26e05ab8906e80a36e7f79672d4b4060f7bc4825 Mon Sep 17 00:00:00 2001
 From: Lukasz Wiecaszek <lukasz.wiecaszek@gmail.com>
 Date: Thu, 26 Jun 2025 14:51:17 +0200
-Subject: [PATCH] cxl/hmu: Find and register CXL CHMU devices
+Subject: [PATCH 1/2] cxl/hmu: Find and register CXL CHMU devices
 
 CXL CHMU (CXL Hotness Monitoring Unit) devices can be found
 from entries in the Register Locator DVSEC.
@@ -22,7 +22,7 @@ Signed-off-by: Lukasz Wiecaszek <lukasz.wiecaszek@gmail.com>
  create mode 100644 drivers/cxl/hmu.h
 
 diff --git a/drivers/cxl/core/Makefile b/drivers/cxl/core/Makefile
-index 086df97a0fcf..555f620faa24 100644
+index 79e2ef81fde8..9f7f2c9780c4 100644
 --- a/drivers/cxl/core/Makefile
 +++ b/drivers/cxl/core/Makefile
 @@ -13,6 +13,7 @@ cxl_core-y += mbox.o
@@ -34,7 +34,7 @@ index 086df97a0fcf..555f620faa24 100644
  cxl_core-y += ras.o
  cxl_core-y += acpi.o
 diff --git a/drivers/cxl/core/core.h b/drivers/cxl/core/core.h
-index 17b692eb3257..404fb65ff837 100644
+index 29b61828a847..703bd508b824 100644
 --- a/drivers/cxl/core/core.h
 +++ b/drivers/cxl/core/core.h
 @@ -9,6 +9,7 @@
@@ -128,7 +128,7 @@ index 000000000000..98cca3256fea
 +}
 +EXPORT_SYMBOL_NS_GPL(devm_cxl_hmu_add, "CXL");
 diff --git a/drivers/cxl/core/port.c b/drivers/cxl/core/port.c
-index 726bd4a7de27..fd153eaf0df4 100644
+index eb46c6764d20..89b70adc5c4a 100644
 --- a/drivers/cxl/core/port.c
 +++ b/drivers/cxl/core/port.c
 @@ -74,6 +74,8 @@ static int cxl_device_id(const struct device *dev)
@@ -232,7 +232,7 @@ index 5ca7b0eed568..c5fe2bf8f8f7 100644
  		break;
  	}
 diff --git a/drivers/cxl/cxl.h b/drivers/cxl/cxl.h
-index a9ab46eb0610..9a879ba11bcb 100644
+index 3f1695c96abc..d4215d203d2c 100644
 --- a/drivers/cxl/cxl.h
 +++ b/drivers/cxl/cxl.h
 @@ -200,6 +200,12 @@ static inline int ways_to_eiw(unsigned int ways, u8 *eiw)
@@ -308,7 +308,7 @@ index a9ab46eb0610..9a879ba11bcb 100644
  
  #define CXL_INSTANCES_COUNT -1
  enum cxl_regloc_type;
-@@ -841,6 +866,7 @@ void cxl_driver_unregister(struct cxl_driver *cxl_drv);
+@@ -844,6 +869,7 @@ void cxl_driver_unregister(struct cxl_driver *cxl_drv);
  #define CXL_DEVICE_PMEM_REGION		7
  #define CXL_DEVICE_DAX_REGION		8
  #define CXL_DEVICE_PMU			9
