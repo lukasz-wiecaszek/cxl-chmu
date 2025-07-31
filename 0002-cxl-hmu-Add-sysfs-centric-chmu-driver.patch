@@ -1,0 +1,889 @@
+From 6bb3a54b2a8d98d40a037fba9c6a1ed7d20616a8 Mon Sep 17 00:00:00 2001
+From: Lukasz Wiecaszek <lukasz.wiecaszek@gmail.com>
+Date: Tue, 8 Jul 2025 14:46:24 +0200
+Subject: [PATCH 2/2] cxl/hmu: Add sysfs-centric chmu driver
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+CXL rev 3.2 introduces a CXL Hotness Monitoring Unit (CHMU) which is
+an interface that allows software running on CXL hosts to identify
+the ‘hot’ memory ranges (i.e., memory ranges with higher access frequency
+relative to other memory ranges) in CXL memory devices in terms of
+memory access counts.
+
+This driver does nothing but exposes the CHMU registers for each of the
+CHMU devices/instances via sysfs files.
+
+Signed-off-by: Lukasz Wiecaszek <lukasz.wiecaszek@gmail.com>
+---
+ drivers/cxl/Kconfig  |  16 +
+ drivers/cxl/Makefile |   3 +
+ drivers/cxl/chmu.c   | 812 +++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 831 insertions(+)
+ create mode 100644 drivers/cxl/chmu.c
+
+diff --git a/drivers/cxl/Kconfig b/drivers/cxl/Kconfig
+index 48b7314afdb8..df63671aec70 100644
+--- a/drivers/cxl/Kconfig
++++ b/drivers/cxl/Kconfig
+@@ -233,4 +233,20 @@ config CXL_MCE
+ 	def_bool y
+ 	depends on X86_MCE && MEMORY_FAILURE
+ 
++config CXL_CHMU
++	tristate "CXL: Hotness Monitoring Unit (CHMU)"
++	depends on CXL_PCI
++	default CXL_BUS
++	help
++	  The CXL Hotness Monitoring Unit (CHMU) is an interface that allows
++	  software running on CXL hosts to identify the ‘hot’ memory ranges
++	  (i.e., memory ranges with higher access frequency relative to other
++	  memory ranges) in CXL memory devices in terms of memory access counts.
++
++	  Say 'y/m' to enable a driver that will attach to CHMU devices for
++	  control of CHMU instances. See Chapter 8.2.8 in the CXL 3.2
++	  specification for a detailed description of CHMU block.
++
++	  If unsure say 'm'.
++
+ endif
+diff --git a/drivers/cxl/Makefile b/drivers/cxl/Makefile
+index 2caa90fa4bf2..63426ee59b0a 100644
+--- a/drivers/cxl/Makefile
++++ b/drivers/cxl/Makefile
+@@ -12,10 +12,13 @@ obj-$(CONFIG_CXL_PORT) += cxl_port.o
+ obj-$(CONFIG_CXL_ACPI) += cxl_acpi.o
+ obj-$(CONFIG_CXL_PMEM) += cxl_pmem.o
+ obj-$(CONFIG_CXL_MEM) += cxl_mem.o
++obj-$(CONFIG_CXL_CHMU) += cxl_chmu.o
+ obj-$(CONFIG_CXL_PCI) += cxl_pci.o
+ 
+ cxl_port-y := port.o
+ cxl_acpi-y := acpi.o
+ cxl_pmem-y := pmem.o security.o
+ cxl_mem-y := mem.o
++cxl_chmu-y := chmu.o
+ cxl_pci-y := pci.o
++
+diff --git a/drivers/cxl/chmu.c b/drivers/cxl/chmu.c
+new file mode 100644
+index 000000000000..8e9771fcd93e
+--- /dev/null
++++ b/drivers/cxl/chmu.c
+@@ -0,0 +1,812 @@
++// SPDX-License-Identifier: GPL-2.0-only
++
++/*
++ * Details in CXL rev 3.2 section 8.2.8 CHMU Register Interface
++ */
++
++#include <linux/bitops.h>
++#include <linux/device.h>
++#include <linux/bits.h>
++#include <linux/list.h>
++#include <linux/bug.h>
++#include <linux/pci.h>
++
++#include "cxlpci.h"
++#include "cxl.h"
++#include "hmu.h"
++
++#define CHMU_VERSION_MAJOR 0
++#define CHMU_VERSION_MINOR 0
++#define CHMU_VERSION_MICRO 1
++
++#define CHMU_VERSION_STR \
++	__stringify(CHMU_VERSION_MAJOR) "." \
++	__stringify(CHMU_VERSION_MINOR) "." \
++	__stringify(CHMU_VERSION_MICRO)
++
++#define CHMU_DRIVER_NAME "chmu"
++
++#define CHMU_ATTR_RO(reg, field) 					\
++	struct device_attribute dev_attr_##reg##_##field = { 		\
++		.attr = { .name = __stringify(field), .mode = 0444 },	\
++		.show = reg##_##field##_show				\
++	}
++
++#define CHMU_ATTR_RW(reg, field) 					\
++	struct device_attribute dev_attr_##reg##_##field = {		\
++		.attr = { .name = __stringify(field), .mode = 0644 },	\
++		.show = reg##_##field##_show,				\
++		.store = reg##_##field##_store				\
++	}
++
++#define CHMU_CAPABILITY_REG_63_0					0x00
++#define   CHMU_CAPABILITY_IRQ_MSG_NUMBER				GENMASK_ULL(3, 0)
++#define   CHMU_CAPABILITY_IRQ_ON_HOTLIST_OVERFLOW			BIT_ULL(4)
++#define   CHMU_CAPABILITY_IRQ_ON_HOTLIST_LEVELS_CROSSING		BIT_ULL(5)
++#define   CHMU_CAPABILITY_EPOCH_TYPE					GENMASK_ULL(7, 6)
++#define   CHMU_CAPABILITY_TRACKED_M2S_REQUESTS				GENMASK_ULL(15, 8)
++#define   CHMU_CAPABILITY_MAX_EPOCH_LENGTH				GENMASK_ULL(31, 16)
++#define   CHMU_CAPABILITY_MIN_EPOCH_LENGTH				GENMASK_ULL(47, 32)
++#define   CHMU_CAPABILITY_HOTLIST_SIZE					GENMASK_ULL(63, 48)
++
++#define CHMU_CAPABILITY_REG_127_64					0x08
++#define   CHMU_CAPABILITY_SUPPORTED_UNIT_SIZES				GENMASK_ULL(31, 0)
++#define   CHMU_CAPABILITY_SUPPORTED_DOWN_SAMPLING_FACTOR		GENMASK_ULL(47, 32)
++#define   CHMU_CAPABILITY_FLAGS						GENMASK_ULL(63, 48)
++
++#define CHMU_CAPABILITY_RANGE_CONF_BITMAP_OFFSET_REG_191_128		0x10
++#define CHMU_CAPABILITY_HOTLIST_OFFSET_REG_255_192			0x18
++
++#define CHMU_CONFIGURATION_REG_63_0					0x40
++#define   CHMU_CONFIGURATION_M2S_REQUESTS_TO_TRACK			GENMASK_ULL(7, 0)
++#define   CHMU_CONFIGURATION_FLAGS_RANDOMIZED_DOWN_SAMPLING		BIT_ULL(8)
++#define   CHMU_CONFIGURATION_FLAGS_IRQ_ON_HOTLIST_OVERFLOW		BIT_ULL(9)
++#define   CHMU_CONFIGURATION_FLAGS_IRQ_ON_HOTLIST_LEVELS_CROSSING	BIT_ULL(10)
++#define   CHMU_CONFIGURATION_CONTROL_ENABLE_HMU				BIT_ULL(16)
++#define   CHMU_CONFIGURATION_CONTROL_RESET_COUNTERS			BIT_ULL(17)
++#define   CHMU_CONFIGURATION_HOTNESS_THRESHOLD				GENMASK_ULL(63, 32)
++
++#define CHMU_CONFIGURATION_REG_127_64					0x48
++#define   CHMU_CONFIGURATION_UNIT_SIZE					GENMASK_ULL(31, 0)
++#define   CHMU_CONFIGURATION_DOWN_SAMPLING_FACTOR			GENMASK_ULL(39, 32)
++#define   CHMU_CONFIGURATION_REPORTING_MODE				GENMASK_ULL(47, 40)
++#define   CHMU_CONFIGURATION_EPOCH_LENGTH				GENMASK_ULL(63, 48)
++
++#define CHMU_CONFIGURATION_REG_191_128					0x50
++#define   CHMU_CONFIGURATION_HOTLIST_NOTIFICATION_THRESHOLD		GENMASK_ULL(15, 0)
++
++#define CHMU_STATUS_REG_63_0						0x60
++#define   CHMU_STATUS_TRACKING_ENABLED					BIT_ULL(0)
++#define   CHMU_STATUS_OPERATION_IN_PROGRESS				GENMASK_ULL(31, 16)
++#define   CHMU_STATUS_COUNTER_WIDTH					GENMASK_ULL(39, 32)
++#define   CHMU_STATUS_HOTLIST_OVERFLOW					BIT_ULL(40)
++#define   CHMU_STATUS_HOTLIST_LEVEL_CROSSED				BIT_ULL(41)
++
++#define CHMU_HOTLIST_HEAD_REG						0x68
++#define CHMU_HOTLIST_TAIL_REG						0x6a
++
++static inline int parse_strtou64(const char *buf, u64 limit, u64 *val)
++{
++	int status;
++
++	status = kstrtou64(buf, 0, val);
++	if (status)
++		return status;
++
++	if (*val > limit)
++		return -EOVERFLOW;
++
++	return status;
++}
++
++static ssize_t capability_irq_msg_number_show(struct device *dev,
++					      struct device_attribute *attr,
++					      char *buf)
++{
++	void __iomem *regs = to_cxl_hmu(dev)->regs;
++	u64 val = readq(regs + CHMU_CAPABILITY_REG_63_0);
++	u8 field = FIELD_GET(CHMU_CAPABILITY_IRQ_MSG_NUMBER, val);
++	return sysfs_emit(buf, "%u\n", field);
++}
++static CHMU_ATTR_RO(capability, irq_msg_number);
++
++static ssize_t capability_irq_on_hotlist_overflow_show(struct device *dev,
++						       struct device_attribute *attr,
++						       char *buf)
++{
++	void __iomem *regs = to_cxl_hmu(dev)->regs;
++	u64 val = readq(regs + CHMU_CAPABILITY_REG_63_0);
++	u8 field = FIELD_GET(CHMU_CAPABILITY_IRQ_ON_HOTLIST_OVERFLOW, val);
++	return sysfs_emit(buf, "%u\n", field);
++}
++static CHMU_ATTR_RO(capability, irq_on_hotlist_overflow);
++
++static ssize_t capability_irq_on_hotlist_levels_crossing_show(struct device *dev,
++							      struct device_attribute *attr,
++							      char *buf)
++{
++	void __iomem *regs = to_cxl_hmu(dev)->regs;
++	u64 val = readq(regs + CHMU_CAPABILITY_REG_63_0);
++	u8 field = FIELD_GET(CHMU_CAPABILITY_IRQ_ON_HOTLIST_LEVELS_CROSSING, val);
++	return sysfs_emit(buf, "%u\n", field);
++}
++static CHMU_ATTR_RO(capability, irq_on_hotlist_levels_crossing);
++
++static ssize_t capability_epoch_type_show(struct device *dev,
++					  struct device_attribute *attr,
++					  char *buf)
++{
++	void __iomem *regs = to_cxl_hmu(dev)->regs;
++	u64 val = readq(regs + CHMU_CAPABILITY_REG_63_0);
++	u8 field = FIELD_GET(CHMU_CAPABILITY_EPOCH_TYPE, val);
++	return sysfs_emit(buf, "%u\n", field);
++}
++static CHMU_ATTR_RO(capability, epoch_type);
++
++static ssize_t capability_tracked_m2s_requests_show(struct device *dev,
++						    struct device_attribute *attr,
++						    char *buf)
++{
++	void __iomem *regs = to_cxl_hmu(dev)->regs;
++	u64 val = readq(regs + CHMU_CAPABILITY_REG_63_0);
++	u8 field = FIELD_GET(CHMU_CAPABILITY_TRACKED_M2S_REQUESTS, val);
++	return sysfs_emit(buf, "0x%02x\n", field);
++}
++static CHMU_ATTR_RO(capability, tracked_m2s_requests);
++
++static ssize_t capability_max_epoch_length_show(struct device *dev,
++						struct device_attribute *attr,
++						char *buf)
++{
++	void __iomem *regs = to_cxl_hmu(dev)->regs;
++	u64 val = readq(regs + CHMU_CAPABILITY_REG_63_0);
++	u16 field = FIELD_GET(CHMU_CAPABILITY_MAX_EPOCH_LENGTH, val);
++	return sysfs_emit(buf, "0x%04x\n", field);
++}
++static CHMU_ATTR_RO(capability, max_epoch_length);
++
++static ssize_t capability_min_epoch_length_show(struct device *dev,
++						struct device_attribute *attr,
++						char *buf)
++{
++	void __iomem *regs = to_cxl_hmu(dev)->regs;
++	u64 val = readq(regs + CHMU_CAPABILITY_REG_63_0);
++	u16 field = FIELD_GET(CHMU_CAPABILITY_MIN_EPOCH_LENGTH, val);
++	return sysfs_emit(buf, "0x%04x\n", field);
++}
++static CHMU_ATTR_RO(capability, min_epoch_length);
++
++static ssize_t capability_hotlist_size_show(struct device *dev,
++					    struct device_attribute *attr,
++					    char *buf)
++{
++	void __iomem *regs = to_cxl_hmu(dev)->regs;
++	u64 val = readq(regs + CHMU_CAPABILITY_REG_63_0);
++	u16 field = FIELD_GET(CHMU_CAPABILITY_HOTLIST_SIZE, val);
++	return sysfs_emit(buf, "%u\n", field);
++}
++static CHMU_ATTR_RO(capability, hotlist_size);
++
++static ssize_t capability_supported_unit_sizes_show(struct device *dev,
++						    struct device_attribute *attr,
++						    char *buf)
++{
++	void __iomem *regs = to_cxl_hmu(dev)->regs;
++	u64 val = readq(regs + CHMU_CAPABILITY_REG_127_64);
++	u32 field = FIELD_GET(CHMU_CAPABILITY_SUPPORTED_UNIT_SIZES, val);
++	return sysfs_emit(buf, "0x%08x\n", field);
++}
++static CHMU_ATTR_RO(capability, supported_unit_sizes);
++
++static ssize_t capability_supported_down_sampling_factor_show(struct device *dev,
++							      struct device_attribute *attr,
++							      char *buf)
++{
++	void __iomem *regs = to_cxl_hmu(dev)->regs;
++	u64 val = readq(regs + CHMU_CAPABILITY_REG_127_64);
++	u16 field = FIELD_GET(CHMU_CAPABILITY_SUPPORTED_DOWN_SAMPLING_FACTOR, val);
++	return sysfs_emit(buf, "0x%04x\n", field);
++}
++static CHMU_ATTR_RO(capability, supported_down_sampling_factor);
++
++static ssize_t capability_flags_show(struct device *dev,
++				     struct device_attribute *attr,
++				     char *buf)
++{
++	void __iomem *regs = to_cxl_hmu(dev)->regs;
++	u64 val = readq(regs + CHMU_CAPABILITY_REG_127_64);
++	u16 field = FIELD_GET(CHMU_CAPABILITY_FLAGS, val);
++	return sysfs_emit(buf, "0x%04x\n", field);
++}
++static CHMU_ATTR_RO(capability, flags);
++
++static ssize_t capability_range_conf_bitmap_offset_show(struct device *dev,
++							struct device_attribute *attr,
++							char *buf)
++{
++	void __iomem *regs = to_cxl_hmu(dev)->regs;
++	u64 val = readq(regs + CHMU_CAPABILITY_RANGE_CONF_BITMAP_OFFSET_REG_191_128);
++	return sysfs_emit(buf, "0x%016llx\n", val);
++}
++static CHMU_ATTR_RO(capability, range_conf_bitmap_offset);
++
++static ssize_t capability_hotlist_offset_show(struct device *dev,
++					      struct device_attribute *attr,
++					      char *buf)
++{
++	void __iomem *regs = to_cxl_hmu(dev)->regs;
++	u64 val = readq(regs + CHMU_CAPABILITY_HOTLIST_OFFSET_REG_255_192);
++	return sysfs_emit(buf, "0x%016llx\n", val);
++}
++static CHMU_ATTR_RO(capability, hotlist_offset);
++
++static struct attribute *capability[] = {
++	&dev_attr_capability_irq_msg_number.attr,
++	&dev_attr_capability_irq_on_hotlist_overflow.attr,
++	&dev_attr_capability_irq_on_hotlist_levels_crossing.attr,
++	&dev_attr_capability_epoch_type.attr,
++	&dev_attr_capability_tracked_m2s_requests.attr,
++	&dev_attr_capability_max_epoch_length.attr,
++	&dev_attr_capability_min_epoch_length.attr,
++	&dev_attr_capability_hotlist_size.attr,
++	&dev_attr_capability_supported_unit_sizes.attr,
++	&dev_attr_capability_supported_down_sampling_factor.attr,
++	&dev_attr_capability_flags.attr,
++	&dev_attr_capability_range_conf_bitmap_offset.attr,
++	&dev_attr_capability_hotlist_offset.attr,
++	NULL
++};
++
++static const struct attribute_group capability_group = {
++	.name = "capability",
++	.attrs = capability
++};
++
++static ssize_t configuration_m2s_requests_to_track_show(struct device *dev,
++							struct device_attribute *attr,
++							char *buf)
++{
++	void __iomem *regs = to_cxl_hmu(dev)->regs;
++	u64 val = readq(regs + CHMU_CONFIGURATION_REG_63_0);
++	u8 field = FIELD_GET(CHMU_CONFIGURATION_M2S_REQUESTS_TO_TRACK, val);
++	return sysfs_emit(buf, "0x%02x\n", field);
++}
++static ssize_t configuration_m2s_requests_to_track_store(struct device *dev,
++							 struct device_attribute *attr,
++							 const char *buf, size_t count)
++{
++	void __iomem *regs = to_cxl_hmu(dev)->regs;
++	u64 val;
++	u64 f;
++	int status;
++
++	status = parse_strtou64(buf, 0xff, &f);
++	if (status)
++		return status;
++
++	val = readq(regs + CHMU_CONFIGURATION_REG_63_0);
++	val &= ~CHMU_CONFIGURATION_M2S_REQUESTS_TO_TRACK;
++	val |= FIELD_PREP(CHMU_CONFIGURATION_M2S_REQUESTS_TO_TRACK, f);
++	writeq(val, regs + CHMU_CONFIGURATION_REG_63_0);
++
++	return count;
++}
++static CHMU_ATTR_RW(configuration, m2s_requests_to_track);
++
++static ssize_t configuration_flags_randomized_down_sampling_show(struct device *dev,
++								 struct device_attribute *attr,
++								 char *buf)
++{
++	void __iomem *regs = to_cxl_hmu(dev)->regs;
++	u64 val = readq(regs + CHMU_CONFIGURATION_REG_63_0);
++	u8 field = FIELD_GET(CHMU_CONFIGURATION_FLAGS_RANDOMIZED_DOWN_SAMPLING, val);
++
++	return sysfs_emit(buf, "%u\n", field);
++}
++static ssize_t configuration_flags_randomized_down_sampling_store(struct device *dev,
++								  struct device_attribute *attr,
++								  const char *buf, size_t count)
++{
++	void __iomem *regs = to_cxl_hmu(dev)->regs;
++	u64 val;
++	u64 f;
++	int status;
++
++	status = parse_strtou64(buf, 1, &f);
++	if (status)
++		return status;
++
++	val = readq(regs + CHMU_CONFIGURATION_REG_63_0);
++	val &= ~CHMU_CONFIGURATION_FLAGS_RANDOMIZED_DOWN_SAMPLING;
++	val |= FIELD_PREP(CHMU_CONFIGURATION_FLAGS_RANDOMIZED_DOWN_SAMPLING, f);
++	writeq(val, regs + CHMU_CONFIGURATION_REG_63_0);
++
++	return count;
++}
++static CHMU_ATTR_RW(configuration, flags_randomized_down_sampling);
++
++static ssize_t configuration_flags_irq_on_hotlist_overflow_show(struct device *dev,
++								struct device_attribute *attr,
++								char *buf)
++{
++	void __iomem *regs = to_cxl_hmu(dev)->regs;
++	u64 val = readq(regs + CHMU_CONFIGURATION_REG_63_0);
++	u8 field = FIELD_GET(CHMU_CONFIGURATION_FLAGS_IRQ_ON_HOTLIST_OVERFLOW, val);
++
++	return sysfs_emit(buf, "%u\n", field);
++}
++static ssize_t configuration_flags_irq_on_hotlist_overflow_store(struct device *dev,
++								 struct device_attribute *attr,
++								 const char *buf, size_t count)
++{
++	void __iomem *regs = to_cxl_hmu(dev)->regs;
++	u64 val;
++	u64 f;
++	int status;
++
++	status = parse_strtou64(buf, 1, &f);
++	if (status)
++		return status;
++
++	val = readq(regs + CHMU_CONFIGURATION_REG_63_0);
++	val &= ~CHMU_CONFIGURATION_FLAGS_IRQ_ON_HOTLIST_OVERFLOW;
++	val |= FIELD_PREP(CHMU_CONFIGURATION_FLAGS_IRQ_ON_HOTLIST_OVERFLOW, f);
++	writeq(val, regs + CHMU_CONFIGURATION_REG_63_0);
++
++	return count;
++}
++static CHMU_ATTR_RW(configuration, flags_irq_on_hotlist_overflow);
++
++static ssize_t configuration_flags_irq_on_hotlist_levels_crossing_show(struct device *dev,
++	struct device_attribute *attr,
++	char *buf)
++{
++	void __iomem *regs = to_cxl_hmu(dev)->regs;
++	u64 val = readq(regs + CHMU_CONFIGURATION_REG_63_0);
++	u8 field = FIELD_GET(CHMU_CONFIGURATION_FLAGS_IRQ_ON_HOTLIST_LEVELS_CROSSING, val);
++
++	return sysfs_emit(buf, "%u\n", field);
++}
++static ssize_t configuration_flags_irq_on_hotlist_levels_crossing_store(struct device *dev,
++	 struct device_attribute *attr,
++	 const char *buf, size_t count)
++{
++	void __iomem *regs = to_cxl_hmu(dev)->regs;
++	u64 val;
++	u64 f;
++	int status;
++
++	status = parse_strtou64(buf, 1, &f);
++	if (status)
++		return status;
++
++	val = readq(regs + CHMU_CONFIGURATION_REG_63_0);
++	val &= ~CHMU_CONFIGURATION_FLAGS_IRQ_ON_HOTLIST_LEVELS_CROSSING;
++	val |= FIELD_PREP(CHMU_CONFIGURATION_FLAGS_IRQ_ON_HOTLIST_LEVELS_CROSSING, f);
++	writeq(val, regs + CHMU_CONFIGURATION_REG_63_0);
++
++	return count;
++}
++static CHMU_ATTR_RW(configuration, flags_irq_on_hotlist_levels_crossing);
++
++static ssize_t configuration_control_enable_hmu_show(struct device *dev,
++						     struct device_attribute *attr,
++						     char *buf)
++{
++	void __iomem *regs = to_cxl_hmu(dev)->regs;
++	u64 val = readq(regs + CHMU_CONFIGURATION_REG_63_0);
++	u8 field = FIELD_GET(CHMU_CONFIGURATION_CONTROL_ENABLE_HMU, val);
++
++pr_info("%s: field: %u\n", __func__, field);
++
++	return sysfs_emit(buf, "%u\n", field);
++}
++static ssize_t configuration_control_enable_hmu_store(struct device *dev,
++						      struct device_attribute *attr,
++						      const char *buf, size_t count)
++{
++	void __iomem *regs = to_cxl_hmu(dev)->regs;
++	u64 val;
++	u64 f;
++	int status;
++
++	status = parse_strtou64(buf, 1, &f);
++	if (status)
++		return status;
++
++	val = readq(regs + CHMU_CONFIGURATION_REG_63_0);
++	val &= ~CHMU_CONFIGURATION_CONTROL_ENABLE_HMU;
++	val |= FIELD_PREP(CHMU_CONFIGURATION_CONTROL_ENABLE_HMU, f);
++	writeq(val, regs + CHMU_CONFIGURATION_REG_63_0);
++
++	pr_info("%s: val: %llu\n", __func__, val);
++
++	return count;
++}
++static CHMU_ATTR_RW(configuration, control_enable_hmu);
++
++static ssize_t configuration_control_reset_counters_show(struct device *dev,
++							 struct device_attribute *attr,
++							 char *buf)
++{
++	void __iomem *regs = to_cxl_hmu(dev)->regs;
++	u64 val = readq(regs + CHMU_CONFIGURATION_REG_63_0);
++	u8 field = FIELD_GET(CHMU_CONFIGURATION_CONTROL_RESET_COUNTERS, val);
++
++	return sysfs_emit(buf, "%u\n", field);
++}
++static ssize_t configuration_control_reset_counters_store(struct device *dev,
++							  struct device_attribute *attr,
++							  const char *buf, size_t count)
++{
++	void __iomem *regs = to_cxl_hmu(dev)->regs;
++	u64 val;
++	u64 f;
++	int status;
++
++	status = parse_strtou64(buf, 1, &f);
++	if (status)
++	return status;
++
++	val = readq(regs + CHMU_CONFIGURATION_REG_63_0);
++	val &= ~CHMU_CONFIGURATION_CONTROL_RESET_COUNTERS;
++	val |= FIELD_PREP(CHMU_CONFIGURATION_CONTROL_RESET_COUNTERS, f);
++	writeq(val, regs + CHMU_CONFIGURATION_REG_63_0);
++
++	return count;
++}
++static CHMU_ATTR_RW(configuration, control_reset_counters);
++
++static ssize_t configuration_hotness_threshold_show(struct device *dev,
++						    struct device_attribute *attr,
++						    char *buf)
++{
++	void __iomem *regs = to_cxl_hmu(dev)->regs;
++	u64 val = readq(regs + CHMU_CONFIGURATION_REG_63_0);
++	u32 field = FIELD_GET(CHMU_CONFIGURATION_HOTNESS_THRESHOLD, val);
++
++	return sysfs_emit(buf, "%u\n", field);
++}
++static ssize_t configuration_hotness_threshold_store(struct device *dev,
++						     struct device_attribute *attr,
++						     const char *buf, size_t count)
++{
++	void __iomem *regs = to_cxl_hmu(dev)->regs;
++	u64 val;
++	u64 f;
++	int status;
++
++	status = parse_strtou64(buf, 0xffffffff, &f);
++	if (status)
++	return status;
++
++	val = readq(regs + CHMU_CONFIGURATION_REG_63_0);
++	val &= ~CHMU_CONFIGURATION_HOTNESS_THRESHOLD;
++	val |= FIELD_PREP(CHMU_CONFIGURATION_HOTNESS_THRESHOLD, f);
++	writeq(val, regs + CHMU_CONFIGURATION_REG_63_0);
++
++	return count;
++}
++static CHMU_ATTR_RW(configuration, hotness_threshold);
++
++static ssize_t configuration_unit_size_show(struct device *dev,
++					    struct device_attribute *attr,
++					    char *buf)
++{
++	void __iomem *regs = to_cxl_hmu(dev)->regs;
++	u64 val = readq(regs + CHMU_CONFIGURATION_REG_127_64);
++	u32 field = FIELD_GET(CHMU_CONFIGURATION_UNIT_SIZE, val);
++
++	return sysfs_emit(buf, "0x%08x\n", field);
++}
++static ssize_t configuration_unit_size_store(struct device *dev,
++					     struct device_attribute *attr,
++					     const char *buf, size_t count)
++{
++	void __iomem *regs = to_cxl_hmu(dev)->regs;
++	u64 val;
++	u64 f;
++	int status;
++
++	status = parse_strtou64(buf, 0xffffffff, &f);
++	if (status)
++	return status;
++
++	val = readq(regs + CHMU_CONFIGURATION_REG_127_64);
++	val &= ~CHMU_CONFIGURATION_UNIT_SIZE;
++	val |= FIELD_PREP(CHMU_CONFIGURATION_UNIT_SIZE, f);
++	writeq(val, regs + CHMU_CONFIGURATION_REG_63_0);
++
++	return count;
++}
++static CHMU_ATTR_RW(configuration, unit_size);
++
++static ssize_t configuration_down_sampling_factor_show(struct device *dev,
++						       struct device_attribute *attr,
++						       char *buf)
++{
++	void __iomem *regs = to_cxl_hmu(dev)->regs;
++	u64 val = readq(regs + CHMU_CONFIGURATION_REG_127_64);
++	u8 field = FIELD_GET(CHMU_CONFIGURATION_DOWN_SAMPLING_FACTOR, val);
++
++	return sysfs_emit(buf, "0x%02x\n", field);
++}
++static ssize_t configuration_down_sampling_factor_store(struct device *dev,
++						        struct device_attribute *attr,
++						        const char *buf, size_t count)
++{
++	void __iomem *regs = to_cxl_hmu(dev)->regs;
++	u64 val;
++	u64 f;
++	int status;
++
++	status = parse_strtou64(buf, 0xff, &f);
++	if (status)
++	return status;
++
++	val = readq(regs + CHMU_CONFIGURATION_REG_127_64);
++	val &= ~CHMU_CONFIGURATION_DOWN_SAMPLING_FACTOR;
++	val |= FIELD_PREP(CHMU_CONFIGURATION_DOWN_SAMPLING_FACTOR, f);
++	writeq(val, regs + CHMU_CONFIGURATION_REG_63_0);
++
++	return count;
++}
++static CHMU_ATTR_RW(configuration, down_sampling_factor);
++
++static ssize_t configuration_reporting_mode_show(struct device *dev,
++						 struct device_attribute *attr,
++						 char *buf)
++{
++	void __iomem *regs = to_cxl_hmu(dev)->regs;
++	u64 val = readq(regs + CHMU_CONFIGURATION_REG_127_64);
++	u8 field = FIELD_GET(CHMU_CONFIGURATION_REPORTING_MODE, val);
++
++	return sysfs_emit(buf, "%u\n", field);
++}
++static ssize_t configuration_reporting_mode_store(struct device *dev,
++						  struct device_attribute *attr,
++						  const char *buf, size_t count)
++{
++	void __iomem *regs = to_cxl_hmu(dev)->regs;
++	u64 val;
++	u64 f;
++	int status;
++
++	status = parse_strtou64(buf, 0xff, &f);
++	if (status)
++	return status;
++
++	val = readq(regs + CHMU_CONFIGURATION_REG_127_64);
++	val &= ~CHMU_CONFIGURATION_REPORTING_MODE;
++	val |= FIELD_PREP(CHMU_CONFIGURATION_REPORTING_MODE, f);
++	writeq(val, regs + CHMU_CONFIGURATION_REG_63_0);
++
++	return count;
++}
++static CHMU_ATTR_RW(configuration, reporting_mode);
++
++static ssize_t configuration_epoch_length_show(struct device *dev,
++					       struct device_attribute *attr,
++					       char *buf)
++{
++	void __iomem *regs = to_cxl_hmu(dev)->regs;
++	u64 val = readq(regs + CHMU_CONFIGURATION_REG_127_64);
++	u16 field = FIELD_GET(CHMU_CONFIGURATION_EPOCH_LENGTH, val);
++
++	return sysfs_emit(buf, "0x%04x\n", field);
++}
++static ssize_t configuration_epoch_length_store(struct device *dev,
++						struct device_attribute *attr,
++						const char *buf, size_t count)
++{
++	void __iomem *regs = to_cxl_hmu(dev)->regs;
++	u64 val;
++	u64 f;
++	int status;
++
++	status = parse_strtou64(buf, 0xffff, &f);
++	if (status)
++		return status;
++
++	val = readq(regs + CHMU_CONFIGURATION_REG_127_64);
++	val &= ~CHMU_CONFIGURATION_EPOCH_LENGTH;
++	val |= FIELD_PREP(CHMU_CONFIGURATION_EPOCH_LENGTH, f);
++	writeq(val, regs + CHMU_CONFIGURATION_REG_63_0);
++
++	return count;
++}
++static CHMU_ATTR_RW(configuration, epoch_length);
++
++static ssize_t configuration_hotlist_notification_threshold_show(struct device *dev,
++								 struct device_attribute *attr,
++								 char *buf)
++{
++	void __iomem *regs = to_cxl_hmu(dev)->regs;
++	u64 val = readq(regs + CHMU_CONFIGURATION_REG_191_128);
++	u16 field = FIELD_GET(CHMU_CONFIGURATION_HOTLIST_NOTIFICATION_THRESHOLD, val);
++
++	return sysfs_emit(buf, "%u\n", field);
++}
++static ssize_t configuration_hotlist_notification_threshold_store(struct device *dev,
++								  struct device_attribute *attr,
++								  const char *buf, size_t count)
++{
++	void __iomem *regs = to_cxl_hmu(dev)->regs;
++	u64 val;
++	u64 f;
++	int status;
++
++	status = parse_strtou64(buf, 0xffff, &f);
++	if (status)
++		return status;
++
++	val = readq(regs + CHMU_CONFIGURATION_REG_191_128);
++	val &= ~CHMU_CONFIGURATION_HOTLIST_NOTIFICATION_THRESHOLD;
++	val |= FIELD_PREP(CHMU_CONFIGURATION_HOTLIST_NOTIFICATION_THRESHOLD, f);
++	writeq(val, regs + CHMU_CONFIGURATION_REG_63_0);
++
++	return count;
++}
++static CHMU_ATTR_RW(configuration, hotlist_notification_threshold);
++
++static struct attribute *configuration[] = {
++	&dev_attr_configuration_m2s_requests_to_track.attr,
++	&dev_attr_configuration_flags_randomized_down_sampling.attr,
++	&dev_attr_configuration_flags_irq_on_hotlist_overflow.attr,
++	&dev_attr_configuration_flags_irq_on_hotlist_levels_crossing.attr,
++	&dev_attr_configuration_control_enable_hmu.attr,
++	&dev_attr_configuration_control_reset_counters.attr,
++	&dev_attr_configuration_hotness_threshold.attr,
++	&dev_attr_configuration_unit_size.attr,
++	&dev_attr_configuration_down_sampling_factor.attr,
++	&dev_attr_configuration_reporting_mode.attr,
++	&dev_attr_configuration_epoch_length.attr,
++	&dev_attr_configuration_hotlist_notification_threshold.attr,
++	NULL
++};
++
++static const struct attribute_group configuration_group = {
++	.name = "configuration",
++	.attrs = configuration
++};
++
++static ssize_t status_tracking_enabled_show(struct device *dev,
++					    struct device_attribute *attr,
++					    char *buf)
++{
++	void __iomem *regs = to_cxl_hmu(dev)->regs;
++	u64 val = readq(regs + CHMU_STATUS_REG_63_0);
++	u8 field = FIELD_GET(CHMU_STATUS_TRACKING_ENABLED, val);
++	return sysfs_emit(buf, "%u\n", field);
++}
++static CHMU_ATTR_RO(status, tracking_enabled);
++
++static ssize_t status_operation_in_progress_show(struct device *dev,
++						 struct device_attribute *attr,
++						 char *buf)
++{
++	void __iomem *regs = to_cxl_hmu(dev)->regs;
++	u64 val = readq(regs + CHMU_STATUS_REG_63_0);
++	u16 field = FIELD_GET(CHMU_STATUS_OPERATION_IN_PROGRESS, val);
++	return sysfs_emit(buf, "0x%04x\n", field);
++}
++static CHMU_ATTR_RO(status, operation_in_progress);
++
++static ssize_t status_counter_width_show(struct device *dev,
++	struct device_attribute *attr,
++	char *buf)
++{
++	void __iomem *regs = to_cxl_hmu(dev)->regs;
++	u64 val = readq(regs + CHMU_STATUS_REG_63_0);
++	u8 field = FIELD_GET(CHMU_STATUS_COUNTER_WIDTH, val);
++	return sysfs_emit(buf, "%u\n", field);
++}
++static CHMU_ATTR_RO(status, counter_width);
++
++static ssize_t status_hotlist_overflow_show(struct device *dev,
++	struct device_attribute *attr,
++	char *buf)
++{
++	void __iomem *regs = to_cxl_hmu(dev)->regs;
++	u64 val = readq(regs + CHMU_STATUS_REG_63_0);
++	u8 field = FIELD_GET(CHMU_STATUS_HOTLIST_OVERFLOW, val);
++	return sysfs_emit(buf, "%u\n", field);
++}
++static CHMU_ATTR_RO(status, hotlist_overflow);
++
++static ssize_t status_hotlist_level_crossed_show(struct device *dev,
++	struct device_attribute *attr,
++	char *buf)
++{
++	void __iomem *regs = to_cxl_hmu(dev)->regs;
++	u64 val = readq(regs + CHMU_STATUS_REG_63_0);
++	u8 field = FIELD_GET(CHMU_STATUS_HOTLIST_LEVEL_CROSSED, val);
++	return sysfs_emit(buf, "%u\n", field);
++}
++static CHMU_ATTR_RO(status, hotlist_level_crossed);
++
++static struct attribute *status[] = {
++	&dev_attr_status_tracking_enabled.attr,
++	&dev_attr_status_operation_in_progress.attr,
++	&dev_attr_status_counter_width.attr,
++	&dev_attr_status_hotlist_overflow.attr,
++	&dev_attr_status_hotlist_level_crossed.attr,
++	NULL
++};
++
++static const struct attribute_group status_group = {
++	.name = "status",
++	.attrs = status
++};
++
++static const struct attribute_group *chmu_groups[] = {
++	&capability_group,
++	&configuration_group,
++	&status_group,
++	NULL
++};
++
++struct chmu_info {
++	void __iomem *base;
++};
++
++static int chmu_probe(struct device *dev)
++{
++	struct chmu_info *info; /* currently not needed */
++
++	info = devm_kzalloc(dev, sizeof(*info), GFP_KERNEL);
++	if (!info)
++		return -ENOMEM;
++
++	pr_info("device %s probed successfully\n", dev_name(dev));
++	return 0;
++}
++
++static void chmu_remove(struct device *dev)
++{
++	pr_info("device %s unbound successfully\n", dev_name(dev));
++}
++
++static struct cxl_driver chmu_driver = {
++	.drv = {
++		.dev_groups = chmu_groups
++	},
++	.name = CHMU_DRIVER_NAME,
++	.probe = chmu_probe,
++	.remove = chmu_remove,
++	.id = CXL_DEVICE_HMU,
++};
++
++static __init int chmu_init(void)
++{
++	int rc;
++
++	rc = cxl_driver_register(&chmu_driver);
++	if (rc)
++		goto out;
++
++	pr_info("%s module loaded (version: %s)\n",
++		KBUILD_MODNAME, CHMU_VERSION_STR);
++	return 0;
++
++out:
++	return rc;
++}
++
++#ifdef MODULE
++static __exit void chmu_exit(void)
++{
++	cxl_driver_unregister(&chmu_driver);
++	pr_info("%s module removed\n", KBUILD_MODNAME);
++}
++#endif
++
++module_init(chmu_init);
++module_exit(chmu_exit);
++
++MODULE_DESCRIPTION("CXL Hotness Monitoring Unit (CHMU) Driver");
++MODULE_AUTHOR("Lukasz Wiecaszek <lukasz.wiecaszek(at)gmail.com>");
++MODULE_LICENSE("GPL v2");
++MODULE_VERSION(CHMU_VERSION_STR);
++MODULE_IMPORT_NS("CXL");
++MODULE_ALIAS_CXL(CXL_DEVICE_HMU);
+-- 
+2.49.0
+
